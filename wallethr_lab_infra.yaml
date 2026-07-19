@@ -1,0 +1,911 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation Template for WalletHR Lab Patching Automation Environment"
+
+Parameters:
+  AmiId:
+    Type: String
+    Default: "ami-0588780b7d752aaa7"
+    Description: "Windows Server 2016 base AMI ID for testing (April 2026 release)"
+  KeyName:
+    Type: String
+    Default: "wallethr-patching"
+    Description: "EC2 Key Pair Name for RDP Access"
+  InstanceType:
+    Type: String
+    Default: "t3.small"
+    Description: "Instance Type for Web Servers"
+  UbuntuAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+    Description: "Latest Ubuntu 24.04 LTS AMI ID resolved dynamically via SSM"
+  GrafanaSnapshotId:
+    Type: String
+    Default: "snap-004addf7983614b08"
+    Description: "EBS Snapshot ID containing pre-configured patching environment for Grafana Server root disk"
+
+Resources:
+  # =========================================================================
+  # 1. NETWORKING RESOURCES
+  # =========================================================================
+  ProdVPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: "192.168.0.0/21"
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: PROD-VPC
+
+  WebProdIGW:
+    Type: "AWS::EC2::InternetGateway"
+    Properties:
+      Tags:
+        - Key: Name
+          Value: WEB-PROD-IGW
+
+  AttachGateway:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref ProdVPC
+      InternetGatewayId: !Ref WebProdIGW
+
+  ProdWebSubnet1A:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref ProdVPC
+      CidrBlock: "192.168.0.0/24"
+      AvailabilityZone: !Sub "${AWS::Region}a"
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Prod-Web-1A-Subnet
+
+  ProdWebSubnet1B:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      VpcId: !Ref ProdVPC
+      CidrBlock: "192.168.1.0/24"
+      AvailabilityZone: !Sub "${AWS::Region}b"
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Prod-Web-1B-Subnet
+
+  WebProdRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref ProdVPC
+      Tags:
+        - Key: Name
+          Value: WEB-PROD-RT
+
+  PublicRoute:
+    Type: "AWS::EC2::Route"
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref WebProdRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref WebProdIGW
+
+  Subnet1ARouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref ProdWebSubnet1A
+      RouteTableId: !Ref WebProdRouteTable
+
+  Subnet1BRouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      SubnetId: !Ref ProdWebSubnet1B
+      RouteTableId: !Ref WebProdRouteTable
+
+  # =========================================================================
+  # 2. SECURITY GROUPS & IAM ROLES
+  # =========================================================================
+  ALBSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Security Group for ALBs allowing HTTP traffic"
+      VpcId: !Ref ProdVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: WEB-PROD-ALB-SG
+
+  InstanceSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Security Group for EC2 instances"
+      VpcId: !Ref ProdVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: WEB-PROD-EC2-SG
+
+  SSMInstanceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+        - !Ref SSMInstanceRole
+
+  # =========================================================================
+  # 3. LOAD BALANCERS & TARGET GROUPS (6 GROUPS)
+  # =========================================================================
+  # --- GROUP 1 ---
+  Grp1PRODTG:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Name: "Grp1-PROD-TG-443"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref ProdVPC
+      HealthCheckPath: "/"
+      HealthCheckPort: "traffic-port"
+      HealthCheckProtocol: HTTP
+      TargetType: instance
+      Targets:
+        - Id: !Ref ProdGrp1WebServer2
+          Port: 80
+        - Id: !Ref ProdGrp1WebServer3
+          Port: 80
+
+  Grp1PRODALB:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: "Grp1-PROD-ALB"
+      Subnets:
+        - !Ref ProdWebSubnet1A
+        - !Ref ProdWebSubnet1B
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Type: application
+
+  Grp1ALBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref Grp1PRODTG
+      LoadBalancerArn: !Ref Grp1PRODALB
+      Port: 80
+      Protocol: HTTP
+
+  # --- GROUP 2 (Group 3 WebServers) ---
+  Grp2PRODTG:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Name: "Grp2-PROD-TG-443"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref ProdVPC
+      HealthCheckPath: "/"
+      HealthCheckPort: "traffic-port"
+      HealthCheckProtocol: HTTP
+      TargetType: instance
+      Targets:
+        - Id: !Ref ProdGrp3WebServer2
+          Port: 80
+        - Id: !Ref ProdGrp3WebServer3
+          Port: 80
+
+  Grp2PRODALB:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: "Grp2-PROD-ALB"
+      Subnets:
+        - !Ref ProdWebSubnet1A
+        - !Ref ProdWebSubnet1B
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Type: application
+
+  Grp2ALBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref Grp2PRODTG
+      LoadBalancerArn: !Ref Grp2PRODALB
+      Port: 80
+      Protocol: HTTP
+
+  # --- GROUP 4 ---
+  Grp4PRODTG:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Name: "Grp4-PROD-TG-443"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref ProdVPC
+      HealthCheckPath: "/"
+      HealthCheckPort: "traffic-port"
+      HealthCheckProtocol: HTTP
+      TargetType: instance
+      Targets:
+        - Id: !Ref ProdGrp4WebServer1
+          Port: 80
+        - Id: !Ref ProdGrp4WebServer2
+          Port: 80
+
+  Grp4PRODALB:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: "Grp4-PROD-ALB"
+      Subnets:
+        - !Ref ProdWebSubnet1A
+        - !Ref ProdWebSubnet1B
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Type: application
+
+  Grp4ALBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref Grp4PRODTG
+      LoadBalancerArn: !Ref Grp4PRODALB
+      Port: 80
+      Protocol: HTTP
+
+  # --- GROUP 5 ---
+  Grp5PRODTG:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Name: "Grp5-PROD-TG-443"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref ProdVPC
+      HealthCheckPath: "/"
+      HealthCheckPort: "traffic-port"
+      HealthCheckProtocol: HTTP
+      TargetType: instance
+      Targets:
+        - Id: !Ref ProdGrp5WebServer2
+          Port: 80
+        - Id: !Ref ProdGrp5WebServer3
+          Port: 80
+
+  Grp5PRODALB:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: "Grp5-PROD-ALB"
+      Subnets:
+        - !Ref ProdWebSubnet1A
+        - !Ref ProdWebSubnet1B
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Type: application
+
+  Grp5ALBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref Grp5PRODTG
+      LoadBalancerArn: !Ref Grp5PRODALB
+      Port: 80
+      Protocol: HTTP
+
+  # --- GROUP 6 ---
+  Grp6PRODTG:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Name: "Grp6-PROD-TG-443"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref ProdVPC
+      HealthCheckPath: "/"
+      HealthCheckPort: "traffic-port"
+      HealthCheckProtocol: HTTP
+      TargetType: instance
+      Targets:
+        - Id: !Ref ProdGrp6WebServer1
+          Port: 80
+        - Id: !Ref ProdGrp6WebServer2
+          Port: 80
+
+  Grp6PRODALB:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: "Grp6-PROD-ALB"
+      Subnets:
+        - !Ref ProdWebSubnet1A
+        - !Ref ProdWebSubnet1B
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Type: application
+
+  Grp6ALBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref Grp6PRODTG
+      LoadBalancerArn: !Ref Grp6PRODALB
+      Port: 80
+      Protocol: HTTP
+
+  # --- GROUP 7 ---
+  Grp7PRODTG:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Name: "Grp7-PROD-TG-443"
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref ProdVPC
+      HealthCheckPath: "/"
+      HealthCheckPort: "traffic-port"
+      HealthCheckProtocol: HTTP
+      TargetType: instance
+      Targets:
+        - Id: !Ref ProdGrp7WebServer1
+          Port: 80
+        - Id: !Ref ProdGrp7WebServer2
+          Port: 80
+
+  Grp7PRODALB:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: "Grp7-PROD-ALB"
+      Subnets:
+        - !Ref ProdWebSubnet1A
+        - !Ref ProdWebSubnet1B
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Type: application
+
+  Grp7ALBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref Grp7PRODTG
+      LoadBalancerArn: !Ref Grp7PRODALB
+      Port: 80
+      Protocol: HTTP
+
+
+
+  # =========================================================================
+  # 4. EC2 WEB SERVERS (6 INSTANCES)
+  # =========================================================================
+  # --- GROUP 1 INSTANCES ---
+  ProdGrp1WebServer2:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1A
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Install-WindowsFeature -name Web-Server -IncludeManagementTools
+          $patch = Get-HotFix | Where-Object { $_.Description -eq "Security Update" } | Select-Object -First 1
+          if ($patch) {
+              $kb = $patch.HotFixID.Replace("KB", "")
+              Start-Process wusa.exe -ArgumentList "/uninstall /kb:$kb /quiet /norestart" -Wait -NoNewWindow
+              Restart-Computer -Force
+          }
+          </powershell>
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 180
+            VolumeType: gp3
+        - DeviceName: "/dev/sdb"
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Prod-Grp1-WebServer2
+        - Key: Is_24-7
+          Value: "Yes"
+
+  ProdGrp1WebServer3:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1B
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Install-WindowsFeature -name Web-Server -IncludeManagementTools
+          $patch = Get-HotFix | Where-Object { $_.Description -eq "Security Update" } | Select-Object -First 1
+          if ($patch) {
+              $kb = $patch.HotFixID.Replace("KB", "")
+              Start-Process wusa.exe -ArgumentList "/uninstall /kb:$kb /quiet /norestart" -Wait -NoNewWindow
+              Restart-Computer -Force
+          }
+          </powershell>
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 180
+            VolumeType: gp3
+        - DeviceName: "/dev/sdb"
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Prod-Grp1-WebServer3
+        - Key: AutoStartDaily
+          Value: "Yes"
+        - Key: AutoStopDaily
+          Value: "Yes"
+        - Key: Is_24-7
+          Value: "No"
+
+  # --- GROUP 2 INSTANCES (Group 3 WebServers) ---
+  ProdGrp3WebServer2:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1A
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Install-WindowsFeature -name Web-Server -IncludeManagementTools
+          $patch = Get-HotFix | Where-Object { $_.Description -eq "Security Update" } | Select-Object -First 1
+          if ($patch) {
+              $kb = $patch.HotFixID.Replace("KB", "")
+              Start-Process wusa.exe -ArgumentList "/uninstall /kb:$kb /quiet /norestart" -Wait -NoNewWindow
+              Restart-Computer -Force
+          }
+          </powershell>
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 180
+            VolumeType: gp3
+        - DeviceName: "/dev/sdb"
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Prod-Grp3-WebServer2
+        - Key: Is_24-7
+          Value: "Yes"
+
+  ProdGrp3WebServer3:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1B
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Install-WindowsFeature -name Web-Server -IncludeManagementTools
+          $patch = Get-HotFix | Where-Object { $_.Description -eq "Security Update" } | Select-Object -First 1
+          if ($patch) {
+              $kb = $patch.HotFixID.Replace("KB", "")
+              Start-Process wusa.exe -ArgumentList "/uninstall /kb:$kb /quiet /norestart" -Wait -NoNewWindow
+              Restart-Computer -Force
+          }
+          </powershell>
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 180
+            VolumeType: gp3
+        - DeviceName: "/dev/sdb"
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Prod-Grp3-WebServer3
+        - Key: AutoStartDaily
+          Value: "Yes"
+        - Key: AutoStopDaily
+          Value: "Yes"
+        - Key: Is_24-7
+          Value: "No"
+
+  # --- GROUP 4 INSTANCES ---
+  ProdGrp4WebServer1:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1A
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Install-WindowsFeature -name Web-Server -IncludeManagementTools
+          $patch = Get-HotFix | Where-Object { $_.Description -eq "Security Update" } | Select-Object -First 1
+          if ($patch) {
+              $kb = $patch.HotFixID.Replace("KB", "")
+              Start-Process wusa.exe -ArgumentList "/uninstall /kb:$kb /quiet /norestart" -Wait -NoNewWindow
+              Restart-Computer -Force
+          }
+          </powershell>
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 180
+            VolumeType: gp3
+        - DeviceName: "/dev/sdb"
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Prod-Grp4-WebServer1
+        - Key: Is_24-7
+          Value: "Yes"
+
+  ProdGrp4WebServer2:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1B
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Install-WindowsFeature -name Web-Server -IncludeManagementTools
+          $patch = Get-HotFix | Where-Object { $_.Description -eq "Security Update" } | Select-Object -First 1
+          if ($patch) {
+              $kb = $patch.HotFixID.Replace("KB", "")
+              Start-Process wusa.exe -ArgumentList "/uninstall /kb:$kb /quiet /norestart" -Wait -NoNewWindow
+              Restart-Computer -Force
+          }
+          </powershell>
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 180
+            VolumeType: gp3
+        - DeviceName: "/dev/sdb"
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Prod-Grp4-WebServer2
+        - Key: AutoStartDaily
+          Value: "Yes"
+        - Key: AutoStopDaily
+          Value: "Yes"
+        - Key: Is_24-7
+          Value: "No"
+
+  # --- GROUP 5 INSTANCES ---
+  ProdGrp5WebServer2:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1A
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Install-WindowsFeature -name Web-Server -IncludeManagementTools
+          $patch = Get-HotFix | Where-Object { $_.Description -eq "Security Update" } | Select-Object -First 1
+          if ($patch) {
+              $kb = $patch.HotFixID.Replace("KB", "")
+              Start-Process wusa.exe -ArgumentList "/uninstall /kb:$kb /quiet /norestart" -Wait -NoNewWindow
+              Restart-Computer -Force
+          }
+          </powershell>
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 180
+            VolumeType: gp3
+        - DeviceName: "/dev/sdb"
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Prod-Grp5-WebServer2
+        - Key: Is_24-7
+          Value: "Yes"
+
+  ProdGrp5WebServer3:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1B
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Install-WindowsFeature -name Web-Server -IncludeManagementTools
+          $patch = Get-HotFix | Where-Object { $_.Description -eq "Security Update" } | Select-Object -First 1
+          if ($patch) {
+              $kb = $patch.HotFixID.Replace("KB", "")
+              Start-Process wusa.exe -ArgumentList "/uninstall /kb:$kb /quiet /norestart" -Wait -NoNewWindow
+              Restart-Computer -Force
+          }
+          </powershell>
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 180
+            VolumeType: gp3
+        - DeviceName: "/dev/sdb"
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Prod-Grp5-WebServer3
+        - Key: AutoStartDaily
+          Value: "Yes"
+        - Key: AutoStopDaily
+          Value: "Yes"
+        - Key: Is_24-7
+          Value: "No"
+
+  # --- GROUP 6 INSTANCES ---
+  ProdGrp6WebServer1:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1A
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Install-WindowsFeature -name Web-Server -IncludeManagementTools
+          $patch = Get-HotFix | Where-Object { $_.Description -eq "Security Update" } | Select-Object -First 1
+          if ($patch) {
+              $kb = $patch.HotFixID.Replace("KB", "")
+              Start-Process wusa.exe -ArgumentList "/uninstall /kb:$kb /quiet /norestart" -Wait -NoNewWindow
+              Restart-Computer -Force
+          }
+          </powershell>
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 180
+            VolumeType: gp3
+        - DeviceName: "/dev/sdb"
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Prod-Grp6-WebServer1
+        - Key: Is_24-7
+          Value: "Yes"
+
+  ProdGrp6WebServer2:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1B
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Install-WindowsFeature -name Web-Server -IncludeManagementTools
+          $patch = Get-HotFix | Where-Object { $_.Description -eq "Security Update" } | Select-Object -First 1
+          if ($patch) {
+              $kb = $patch.HotFixID.Replace("KB", "")
+              Start-Process wusa.exe -ArgumentList "/uninstall /kb:$kb /quiet /norestart" -Wait -NoNewWindow
+              Restart-Computer -Force
+          }
+          </powershell>
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 180
+            VolumeType: gp3
+        - DeviceName: "/dev/sdb"
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Prod-Grp6-WebServer2
+        - Key: AutoStartDaily
+          Value: "Yes"
+        - Key: AutoStopDaily
+          Value: "Yes"
+        - Key: Is_24-7
+          Value: "No"
+
+  # --- GROUP 7 INSTANCES ---
+  ProdGrp7WebServer1:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1A
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Install-WindowsFeature -name Web-Server -IncludeManagementTools
+          $patch = Get-HotFix | Where-Object { $_.Description -eq "Security Update" } | Select-Object -First 1
+          if ($patch) {
+              $kb = $patch.HotFixID.Replace("KB", "")
+              Start-Process wusa.exe -ArgumentList "/uninstall /kb:$kb /quiet /norestart" -Wait -NoNewWindow
+              Restart-Computer -Force
+          }
+          </powershell>
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 180
+            VolumeType: gp3
+        - DeviceName: "/dev/sdb"
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Prod-Grp7-WebServer1
+        - Key: Is_24-7
+          Value: "Yes"
+
+  ProdGrp7WebServer2:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1B
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          Install-WindowsFeature -name Web-Server -IncludeManagementTools
+          $patch = Get-HotFix | Where-Object { $_.Description -eq "Security Update" } | Select-Object -First 1
+          if ($patch) {
+              $kb = $patch.HotFixID.Replace("KB", "")
+              Start-Process wusa.exe -ArgumentList "/uninstall /kb:$kb /quiet /norestart" -Wait -NoNewWindow
+              Restart-Computer -Force
+          }
+          </powershell>
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 180
+            VolumeType: gp3
+        - DeviceName: "/dev/sdb"
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: Prod-Grp7-WebServer2
+        - Key: AutoStartDaily
+          Value: "Yes"
+        - Key: AutoStopDaily
+          Value: "Yes"
+        - Key: Is_24-7
+          Value: "No"
+
+  GrafanaAdminRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AdministratorAccess"
+
+  GrafanaInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Roles:
+        - !Ref GrafanaAdminRole
+
+  GrafanaServer:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: "t3.small"
+      KeyName: !Ref KeyName
+      SubnetId: !Ref ProdWebSubnet1A
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref GrafanaInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          mkdir -p /root/patching
+          cd /root
+          if [ ! -d /root/patching/.git ]; then
+              rm -rf /root/patching
+              git clone https://github.com/Roshan0102/patching.git /root/patching
+          else
+              cd /root/patching
+              git pull origin main
+          fi
+      Tags:
+        - Key: Name
+          Value: Grafana-Server
+
+
+
