@@ -12,16 +12,12 @@ Parameters:
     Description: "EC2 Key Pair Name for RDP Access"
   InstanceType:
     Type: String
-    Default: "t3.small"
+    Default: "t3.micro"
     Description: "Instance Type for Web Servers"
   UbuntuAmiId:
     Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
     Default: "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
     Description: "Latest Ubuntu 24.04 LTS AMI ID resolved dynamically via SSM"
-  GrafanaSnapshotId:
-    Type: String
-    Default: "snap-004addf7983614b08"
-    Description: "EBS Snapshot ID containing pre-configured patching environment for Grafana Server root disk"
 
 Resources:
   # =========================================================================
@@ -894,6 +890,8 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
+          apt-get update -y
+          apt-get install -y python3-boto3 python3-dotenv git
           mkdir -p /root/patching
           cd /root
           if [ ! -d /root/patching/.git ]; then

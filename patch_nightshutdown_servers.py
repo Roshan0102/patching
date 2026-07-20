@@ -361,9 +361,12 @@ def scan_patches_step(groups_dict):
     # Retrieve missing patches list
     missing_patches_report = []
     total_missing = 0
+    groups_to_patch = {}
+    inst_to_grp = {details["NightShutdown"]["InstanceId"]: grp for grp, details in groups_dict.items()}
 
     for inst_id in instance_ids:
         name = id_to_name[inst_id]
+        grp = inst_to_grp[inst_id]
         missing_list = []
         try:
             paginator = ssm.get_paginator('describe_instance_patches')
@@ -381,10 +384,13 @@ def scan_patches_step(groups_dict):
             if missing_list:
                 total_missing += len(missing_list)
                 missing_patches_report.append(f"- {name} ({inst_id}):\n" + "\n".join(missing_list))
+                groups_to_patch[grp] = groups_dict[grp]
+            else:
+                logger.info(f"Group '{grp}': {name} ({inst_id}) has 0 missing patches. Skipping patching for this group.")
         except Exception as e:
             raise StepFailure("Step 3: Scan for Missing Patches", f"Failed to retrieve patches for {name} ({inst_id}): {e}")
 
-    return total_missing, missing_patches_report
+    return total_missing, missing_patches_report, groups_to_patch
 
 # =========================================================================
 # STEP 4: DEREGISTER THE NIGHT SHUTDOWN SERVERS FROM THEIR TARGET GROUPS
@@ -686,27 +692,27 @@ def main():
         start_nightshutdown_step(discovered_groups)
 
         # Step 3: Scan Night Shutdown servers for missing patches
-        total_missing, missing_report = scan_patches_step(discovered_groups)
-        if total_missing > 0:
+        total_missing, missing_report, groups_to_patch = scan_patches_step(discovered_groups)
+        if total_missing > 0 and groups_to_patch:
             msg_lines = ["Step 3: Scan for Missing Patches - Missing patches found:\n"]
             msg_lines.extend(missing_report)
             send_sns_notification("\n".join(msg_lines))
         else:
-            send_sns_notification("Step 3: Scan for Missing Patches - No missing patches found. Stopping Night Shutdown servers and exiting.")
-            logger.info("No missing patches found. Stopping instances...")
+            send_sns_notification("Step 3: Scan for Missing Patches - No missing patches found on any Night Shutdown server. Stopping instances and exiting.")
+            logger.info("No missing patches found on any server. Stopping instances...")
             stop_nightshutdown_step(discovered_groups)
             logger.info("Instances stopped. Terminating execution.")
             sys.exit(0)
 
-        # Batching Setup
-        group_keys = list(discovered_groups.keys())
+        # Batching Setup - process only groups with missing patches
+        group_keys = list(groups_to_patch.keys())
         batches = []
         max_batch_size = int(os.getenv("MAX_CONCURRENT_BATCHES", "3"))
         batch_delay = int(os.getenv("BATCH_DELAY_SECONDS", "30"))
 
         for i in range(0, len(group_keys), max_batch_size):
             batch_keys = group_keys[i:i + max_batch_size]
-            batch_dict = {k: discovered_groups[k] for k in batch_keys}
+            batch_dict = {k: groups_to_patch[k] for k in batch_keys}
             batches.append(batch_dict)
 
         logger.info(f"Total target groups split into {len(batches)} batch(es) (Size: {max_batch_size}).")
