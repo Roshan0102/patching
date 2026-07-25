@@ -283,6 +283,7 @@ def scan_patches_step(groups_dict):
                 groups_to_patch[grp] = groups_dict[grp]
             else:
                 logger.info(f"Group '{grp}': {name} ({inst_id}) has 0 missing patches. Skipping patching for this group.")
+                missing_patches_report.append(f"- {name} ({inst_id}): No missing patches found.")
         except Exception as e:
             raise StepFailure("Step 2: Scan for Missing Patches", f"Failed to retrieve patches for {name} ({inst_id}): {e}")
 
