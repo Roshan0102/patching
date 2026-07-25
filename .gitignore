@@ -8,5 +8,7 @@
 !.gitignore
 !patch_24_7_servers.py
 !patch_nightshutdown_servers.py
+!scan_24_7_servers.py
+!scan_nightshutdown_servers.py
 !.env
 !wallethr_lab_infra.yaml
