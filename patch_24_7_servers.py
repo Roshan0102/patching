@@ -204,6 +204,29 @@ def setup_ssm_patch_groups():
     except Exception as e:
         raise StepFailure("SSM Setup", f"Failed to register default patch baseline: {e}")
 
+def clear_wua_datastore_step(instance_ids):
+    """Clears WUA DataStore cache to prevent null KBId errors prior to scan/patch operations."""
+    if not instance_ids:
+        return
+    logger.info(f"Clearing WUA DataStore cache on {len(instance_ids)} instance(s)...")
+    try:
+        response = ssm.send_command(
+            InstanceIds=instance_ids,
+            DocumentName="AWS-RunPowerShellScript",
+            Parameters={
+                "commands": [
+                    'Stop-Service wuauserv -Force -ErrorAction SilentlyContinue',
+                    'Remove-Item "C:\\Windows\\SoftwareDistribution\\DataStore\\*" -Recurse -Force -ErrorAction SilentlyContinue',
+                    'Start-Service wuauserv -ErrorAction SilentlyContinue'
+                ]
+            },
+            TimeoutSeconds=120,
+            Comment="Clear WUA DataStore cache to prevent null KBId errors"
+        )
+        time.sleep(5)
+    except Exception as e:
+        logger.warning(f"Notice: WUA DataStore cleanup SSM call warning: {e}")
+
 # =========================================================================
 # STEP 2: SCAN THE 24/7 SERVERS FOR MISSING PATCHES
 # =========================================================================
@@ -212,6 +235,9 @@ def scan_patches_step(groups_dict):
     instance_ids = [details["24_7"]["InstanceId"] for details in groups_dict.values()]
     id_to_name = {details["24_7"]["InstanceId"]: details["24_7"]["Name"] for details in groups_dict.values()}
     
+    # Pre-clean WUA DataStore cache to prevent null KBId errors
+    clear_wua_datastore_step(instance_ids)
+
     try:
         response = ssm.send_command(
             InstanceIds=instance_ids,
@@ -253,6 +279,9 @@ def scan_patches_step(groups_dict):
             "Step 2: Scan for Missing Patches",
             "SSM Scan failed to complete on the following instances:\n" + "\n".join(failed_scans)
         )
+
+    logger.info("SSM Scan completed. Waiting 15 seconds for SSM compliance database sync...")
+    time.sleep(15)
 
     # Retrieve missing patches list
     missing_patches_report = []
@@ -527,13 +556,16 @@ def patch_servers_step(groups_dict):
     instance_ids = [details["24_7"]["InstanceId"] for details in groups_dict.values()]
     id_to_name = {details["24_7"]["InstanceId"]: details["24_7"]["Name"] for details in groups_dict.values()}
     
+    # Pre-clean WUA DataStore cache to prevent null KBId errors
+    clear_wua_datastore_step(instance_ids)
+
     try:
         response = ssm.send_command(
             InstanceIds=instance_ids,
             DocumentName="AWS-RunPatchBaseline",
             Parameters={
                 "Operation": ["Install"],
-                "RebootOption": ["RebootIfNeeded"]
+                "RebootOption": ["NoReboot"]
             },
             TimeoutSeconds=5400,
             Comment="Automated patching execution for 24/7 servers"

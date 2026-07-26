@@ -96,6 +96,30 @@ def register_patch_baseline():
         logger.warning(f"Default patch baseline registration warning: {e}")
 
 
+def clear_wua_datastore_step(instance_ids):
+    """Clears WUA DataStore cache to prevent null KBId errors prior to scan/patch operations."""
+    if not instance_ids:
+        return
+    logger.info(f"Clearing WUA DataStore cache on {len(instance_ids)} instance(s)...")
+    try:
+        response = ssm.send_command(
+            InstanceIds=instance_ids,
+            DocumentName="AWS-RunPowerShellScript",
+            Parameters={
+                "commands": [
+                    'Stop-Service wuauserv -Force -ErrorAction SilentlyContinue',
+                    'Remove-Item "C:\\Windows\\SoftwareDistribution\\DataStore\\*" -Recurse -Force -ErrorAction SilentlyContinue',
+                    'Start-Service wuauserv -ErrorAction SilentlyContinue'
+                ]
+            },
+            TimeoutSeconds=120,
+            Comment="Clear WUA DataStore cache to prevent null KBId errors"
+        )
+        time.sleep(5)
+    except Exception as e:
+        logger.warning(f"Notice: WUA DataStore cleanup SSM call warning: {e}")
+
+
 def scan_patches(instances):
     """Triggers SSM AWS-RunPatchBaseline Scan operation and retrieves missing patches."""
     if not instances:
@@ -104,6 +128,9 @@ def scan_patches(instances):
 
     instance_ids = [inst['InstanceId'] for inst in instances]
     id_to_name = {inst['InstanceId']: inst['Name'] for inst in instances}
+
+    # Pre-clean WUA DataStore cache to prevent null KBId errors
+    clear_wua_datastore_step(instance_ids)
 
     logger.info(f"Triggering SSM Patch Scan on {len(instance_ids)} instance(s)...")
     try:
@@ -146,6 +173,9 @@ def scan_patches(instances):
     if failed_scans:
         logger.error("SSM Scan failed to complete on the following instances:\n" + "\n".join(failed_scans))
         sys.exit(1)
+
+    logger.info("SSM Scan completed. Waiting 15 seconds for SSM compliance database sync...")
+    time.sleep(15)
 
     # Retrieve missing patches list via describe_instance_patches
     missing_patches_report = []
