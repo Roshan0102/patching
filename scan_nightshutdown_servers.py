@@ -6,57 +6,53 @@ import boto3
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
+# =========================================================================
+# ENVIRONMENT & LOGGING INITIALIZATION
+# =========================================================================
+# Load environment variables from the local .env file (e.g. AWS_REGION, PATCH_BASELINE_ID)
 load_dotenv()
 
-# Configure Console Logging (No log files generated)
+# Configure console logging format to display timestamps and log severity levels
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# AWS Configuration from .env
-AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
-SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN")
+# Read configuration settings from environment variables
+AWS_REGION = os.getenv("AWS_REGION")
 PATCH_BASELINE_ID = os.getenv("PATCH_BASELINE_ID")
 
-TAG_KEY_24_7 = os.getenv("TAG_KEY_24_7", "Is_24-7")
-TAG_VALUE_STANDBY = os.getenv("TAG_VALUE_STANDBY", "No")
+# Tag filters to identify Night Shutdown (standby) web servers
+TAG_KEY_24_7 = os.getenv("TAG_KEY_24_7")
+TAG_VALUE_STANDBY = os.getenv("TAG_VALUE_STANDBY")
 
-SNS_ENABLED = os.getenv("SNS_ENABLED", "True").lower() == "true"
-
-# Initialize Boto3 Clients
+# Initialize AWS Boto3 SDK Clients for EC2 and SSM
 try:
     ec2 = boto3.client("ec2", region_name=AWS_REGION)
     ssm = boto3.client("ssm", region_name=AWS_REGION)
-    sns = boto3.client("sns", region_name=AWS_REGION)
 except Exception as e:
-    logger.error(f"Failed to initialize AWS clients: {e}")
+    logger.error(f"Failed to initialize AWS boto3 clients: {e}")
     sys.exit(1)
 
 
-def send_sns_notification(message, subject="WalletHR Night Shutdown Servers Patch Scan Report"):
-    """Sends SNS notification if enabled and ARN is present."""
-    if not SNS_ENABLED or not SNS_TOPIC_ARN:
-        logger.info("SNS notifications disabled or SNS_TOPIC_ARN not set. Skipping notification.")
-        return
-    try:
-        sns.publish(
-            TopicArn=SNS_TOPIC_ARN,
-            Subject=subject,
-            Message=message
-        )
-        logger.info("SNS notification sent successfully.")
-    except Exception as e:
-        logger.error(f"Failed to send SNS notification: {e}")
-
-
+# =========================================================================
+# FUNCTION 1: DISCOVER NIGHT SHUTDOWN SERVERS
+# =========================================================================
 def discover_nightshutdown_servers():
-    """Discovers running Night Shutdown (standby) web servers using tags."""
-    logger.info("Starting Resource Discovery for Night Shutdown servers...")
+    """
+    Discovers all running Night Shutdown EC2 web servers using AWS EC2 Tags.
+    Filter criteria:
+      - Tag Key 'Is_24-7' = 'No'
+      - Instance State = 'running'
+    """
+    logger.info("==================================================")
+    logger.info("   Step 1: Discovering Night Shutdown Servers     ")
+    logger.info("==================================================")
     discovered = []
+
     try:
+        # Use Boto3 paginator to handle accounts with many EC2 instances smoothly
         paginator = ec2.get_paginator('describe_instances')
         page_iterator = paginator.paginate(
             Filters=[
@@ -64,45 +60,71 @@ def discover_nightshutdown_servers():
                 {'Name': 'instance-state-name', 'Values': ['running']}
             ]
         )
+
+        # Loop through pages -> reservations -> instances
         for page in page_iterator:
             for reservation in page.get('Reservations', []):
                 for instance in reservation.get('Instances', []):
                     inst_id = instance.get('InstanceId')
+
+                    # Convert the list of tag dicts into a key-value dictionary for easy lookup
                     tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
                     name = tags.get('Name', inst_id)
-                    tg_name = tags.get('TargetGroup', 'N/A')
+
+                    # Append discovered instance details to the list
                     discovered.append({
                         'InstanceId': inst_id,
-                        'Name': name,
-                        'TargetGroup': tg_name
+                        'Name': name
                     })
 
-        logger.info(f"Discovered {len(discovered)} running Night Shutdown web server(s).")
+        # Print summary of discovered servers to the terminal
+        logger.info(f"Discovered {len(discovered)} running Night Shutdown web server(s):")
+        for server in discovered:
+            logger.info(f"  - {server['Name']} ({server['InstanceId']})")
+
         return discovered
+
     except Exception as e:
         logger.error(f"Resource Discovery failed: {e}")
         sys.exit(1)
 
 
+# =========================================================================
+# FUNCTION 2: REGISTER DEFAULT PATCH BASELINE
+# =========================================================================
 def register_patch_baseline():
-    """Registers default patch baseline if configured in .env."""
+    """
+    Registers the default AWS SSM Patch Baseline configured in the .env file.
+    Ensures SSM uses the specified baseline rules for patch evaluations.
+    """
     if not PATCH_BASELINE_ID:
         return
+
     try:
-        logger.info(f"Setting up Default Patch Baseline ID: {PATCH_BASELINE_ID}")
+        logger.info(f"Registering Default Patch Baseline ID: {PATCH_BASELINE_ID}")
         ssm.register_default_patch_baseline(BaselineId=PATCH_BASELINE_ID)
         logger.info("Successfully registered default patch baseline.")
     except Exception as e:
         logger.warning(f"Default patch baseline registration warning: {e}")
 
 
+# =========================================================================
+# FUNCTION 3: CLEAR WUA DATASTORE CACHE
+# =========================================================================
 def clear_wua_datastore_step(instance_ids):
-    """Clears WUA DataStore cache to prevent null KBId errors prior to scan/patch operations."""
+    """
+    Clears Windows Update Agent (WUA) DataStore cache prior to scanning.
+    Why this is needed:
+      Prevents 'KBId: null' errors and SSM exit code 1 failures caused by
+      corrupted or orphaned update catalog cache files on target servers.
+    """
     if not instance_ids:
         return
+
     logger.info(f"Clearing WUA DataStore cache on {len(instance_ids)} instance(s)...")
     try:
-        response = ssm.send_command(
+        # Execute PowerShell script via SSM to stop wuauserv, remove DataStore files, and restart service
+        ssm.send_command(
             InstanceIds=instance_ids,
             DocumentName="AWS-RunPowerShellScript",
             Parameters={
@@ -115,25 +137,40 @@ def clear_wua_datastore_step(instance_ids):
             TimeoutSeconds=120,
             Comment="Clear WUA DataStore cache to prevent null KBId errors"
         )
+        # Give services 5 seconds to stabilize after restart
         time.sleep(5)
     except Exception as e:
         logger.warning(f"Notice: WUA DataStore cleanup SSM call warning: {e}")
 
 
+# =========================================================================
+# FUNCTION 4: TRIGGER SSM SCAN & GATHER MISSING PATCHES
+# =========================================================================
 def scan_patches(instances):
-    """Triggers SSM AWS-RunPatchBaseline Scan operation and retrieves missing patches."""
+    """
+    Triggers AWS-RunPatchBaseline SSM command with:
+      - Operation: Scan (Only checks for missing updates, does not install)
+      - RebootOption: NoReboot (Does not restart the server)
+    Then polls for SSM completion and queries missing patch details per server.
+    """
     if not instances:
         logger.info("No instances provided for scanning.")
         return 0, []
 
+    # Extract instance IDs and mapping dictionary for logging
     instance_ids = [inst['InstanceId'] for inst in instances]
     id_to_name = {inst['InstanceId']: inst['Name'] for inst in instances}
 
-    # Pre-clean WUA DataStore cache to prevent null KBId errors
+    # Step A: Clean Windows Update Agent cache before scanning
     clear_wua_datastore_step(instance_ids)
 
-    logger.info(f"Triggering SSM Patch Scan on {len(instance_ids)} instance(s)...")
+    logger.info("==================================================")
+    logger.info("   Step 2: SSM Patch Scan Started                 ")
+    logger.info("==================================================")
+    logger.info(f"Triggering SSM AWS-RunPatchBaseline (Operation: Scan, RebootOption: NoReboot) on {len(instance_ids)} instance(s)...")
+
     try:
+        # Send SSM RunPatchBaseline command to all target instances concurrently
         response = ssm.send_command(
             InstanceIds=instance_ids,
             DocumentName="AWS-RunPatchBaseline",
@@ -144,40 +181,49 @@ def scan_patches(instances):
             Comment="Automated scan for missing patches on Night Shutdown web servers"
         )
         command_id = response["Command"]["CommandId"]
+        logger.info(f"SSM Scan Command ID: {command_id}")
     except Exception as e:
         logger.error(f"Failed to send SSM Scan command: {e}")
         sys.exit(1)
 
-    # Wait for SSM command completion
+    # Step B: Poll SSM invocation status for each instance until completion
     failed_scans = []
     for inst_id in instance_ids:
         name = id_to_name[inst_id]
         elapsed = 0
+        logger.info(f"Waiting for SSM scan completion on {name} ({inst_id})...")
+
         while True:
             try:
                 invocation = ssm.get_command_invocation(CommandId=command_id, InstanceId=inst_id)
                 status = invocation["Status"]
+
                 if status == "Success":
+                    logger.info(f"  * {name} ({inst_id}) -> SSM Scan Status: Success")
                     break
                 elif status in ["Failed", "TimedOut", "Cancelled"]:
                     failed_scans.append(f"{name} ({inst_id}) - SSM Status: {status}")
+                    logger.error(f"  * {name} ({inst_id}) -> SSM Scan Status: {status}")
                     break
             except ClientError:
-                pass
+                pass  # Invocation record might take a few seconds to register
+
             time.sleep(10)
             elapsed += 10
-            if elapsed >= 1200:
+            if elapsed >= 1200:  # 20 minutes timeout
                 failed_scans.append(f"{name} ({inst_id}) - Wait timeout")
                 break
 
+    # If any server failed during SSM scan, abort script and log error
     if failed_scans:
         logger.error("SSM Scan failed to complete on the following instances:\n" + "\n".join(failed_scans))
         sys.exit(1)
 
-    logger.info("SSM Scan completed. Waiting 15 seconds for SSM compliance database sync...")
+    # Step C: Wait 15 seconds to ensure AWS SSM compliance database synchronizes
+    logger.info("SSM Scan execution complete. Syncing compliance database (15s)...")
     time.sleep(15)
 
-    # Retrieve missing patches list via describe_instance_patches
+    # Step D: Query AWS SSM describe_instance_patches API for missing KB IDs
     missing_patches_report = []
     total_missing = 0
 
@@ -197,6 +243,7 @@ def scan_patches(instances):
                     text_severity = patch.get('Severity', 'N/A')
                     missing_list.append(f"  * {kb_id} - {title} (Severity: {text_severity})")
 
+            # Build report entry for this server
             if missing_list:
                 total_missing += len(missing_list)
                 missing_patches_report.append(f"- {name} ({inst_id}):\n" + "\n".join(missing_list))
@@ -208,47 +255,47 @@ def scan_patches(instances):
     return total_missing, missing_patches_report
 
 
+# =========================================================================
+# MAIN EXECUTION FLOW
+# =========================================================================
 def main():
     logger.info("==================================================")
     logger.info(" WalletHR: Night Shutdown Servers Patch Scan Script")
     logger.info("==================================================")
 
-    # Step 1: Discover Night Shutdown Servers
+    # Step 1: Discover Night Shutdown Servers tagged with Is_24-7 = No
     discovered_servers = discover_nightshutdown_servers()
 
     if not discovered_servers:
-        msg = "WalletHR Night Shutdown Servers Patch Scan Report:\n\nNo running Night Shutdown web servers discovered."
-        logger.info(msg)
-        send_sns_notification(msg)
+        logger.info("No running Night Shutdown web servers discovered. Exiting.")
         sys.exit(0)
 
-    discovery_msg_lines = ["WalletHR Night Shutdown Servers Discovered:\n"]
-    for server in discovered_servers:
-        discovery_msg_lines.append(f"- {server['Name']} ({server['InstanceId']}) [Target Group: {server['TargetGroup']}]")
-
-    # Step 2: Register Patch Baseline
+    # Step 2: Register Default Patch Baseline if configured
     register_patch_baseline()
 
-    # Step 3: Trigger Scan & Gather Report
+    # Step 3: Execute SSM Scan (NoReboot) and collect missing patch details
     total_missing, missing_report = scan_patches(discovered_servers)
 
-    # Build Final Notification Message
-    report_lines = ["WalletHR Night Shutdown Web Servers - Patch Scan Report\n"]
-    report_lines.append("\n".join(discovery_msg_lines))
-    report_lines.append("\n--------------------------------------------------")
+    # Step 4: Display final scan results in the terminal
+    logger.info("==================================================")
+    logger.info("   Step 3: Final Patch Scan Results Summary       ")
+    logger.info("==================================================")
 
     if total_missing > 0:
-        report_lines.append(f"\nScan Summary: {total_missing} missing patch(es) found across fleet. Action required.\n")
-        report_lines.append("Missing Patches Detail:")
-        report_lines.extend(missing_report)
+        logger.info(f"Scan Result: Total {total_missing} missing patch(es) found across fleet. Action required.\n")
+        logger.info("Missing Patches Detail:")
+        for line in missing_report:
+            print(line)
     else:
-        report_lines.append("\nScan Summary: All Night Shutdown web servers are fully compliant. No missing patches found.\n")
-        report_lines.extend(missing_report)
+        logger.info("Scan Result: All Night Shutdown web servers are fully compliant. No missing patches found.\n")
+        for line in missing_report:
+            print(line)
 
-    final_report = "\n".join(report_lines)
-    logger.info("\n" + final_report)
-    send_sns_notification(final_report)
+    logger.info("==================================================")
+    logger.info(" Night Shutdown Web Servers Patch Scan Completed! ")
+    logger.info("==================================================")
 
 
+# Entry point guard
 if __name__ == "__main__":
     main()

@@ -31,13 +31,13 @@ def load_env_file(filepath=".env"):
 # Load env variables at start
 load_env_file()
 
-REGION = os.getenv("AWS_REGION", "ap-south-1")
-PATCH_BASELINE_ID = os.getenv("PATCH_BASELINE_ID", "pb-0123456789abcdef0")
-SNS_ENABLED = os.getenv("SNS_ENABLED", "True").lower() == "true"
-SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN", "")
-TAG_KEY_24_7 = os.getenv("TAG_KEY_24_7", "Is_24-7")
-TAG_VALUE_24_7 = os.getenv("TAG_VALUE_24_7", "Yes")
-TAG_VALUE_STANDBY = os.getenv("TAG_VALUE_STANDBY", "No")
+REGION = os.getenv("AWS_REGION")
+PATCH_BASELINE_ID = os.getenv("PATCH_BASELINE_ID")
+SNS_ENABLED = str(os.getenv("SNS_ENABLED")).lower() == "true"
+SNS_TOPIC_ARN = os.getenv("SNS_TOPIC_ARN")
+TAG_KEY_24_7 = os.getenv("TAG_KEY_24_7")
+TAG_VALUE_24_7 = os.getenv("TAG_VALUE_24_7")
+TAG_VALUE_STANDBY = os.getenv("TAG_VALUE_STANDBY")
 
 # Logging setup
 LOG_DIR = "night_shutdown_servers_logs"
@@ -213,6 +213,11 @@ def start_nightshutdown_step(groups_dict):
     id_to_name = {details["NightShutdown"]["InstanceId"]: details["NightShutdown"]["Name"] for details in groups_dict.values()}
     targets_to_wait = [(details["TargetGroupARN"], details["NightShutdown"]["InstanceId"], details["NightShutdown"]["Name"]) for details in groups_dict.values()]
 
+    msg_lines = ["Step 2: Start Night Shutdown Servers Started\nInitiating startup of Night Shutdown instances:\n"]
+    for inst_id in instance_ids:
+        msg_lines.append(f"- {id_to_name[inst_id]} ({inst_id})")
+    send_sns_notification("\n".join(msg_lines))
+
     try:
         ec2.start_instances(InstanceIds=instance_ids)
     except Exception as e:
@@ -339,6 +344,11 @@ def scan_patches_step(groups_dict):
     instance_ids = [details["NightShutdown"]["InstanceId"] for details in groups_dict.values()]
     id_to_name = {details["NightShutdown"]["InstanceId"]: details["NightShutdown"]["Name"] for details in groups_dict.values()}
     
+    msg_lines = ["Step 3: Scan for Missing Patches Started\nInitiating SSM Patch Scan on Night Shutdown web servers:\n"]
+    for inst_id in instance_ids:
+        msg_lines.append(f"- {id_to_name[inst_id]} ({inst_id})")
+    send_sns_notification("\n".join(msg_lines))
+
     # Pre-clean WUA DataStore cache to prevent null KBId errors
     clear_wua_datastore_step(instance_ids)
 
@@ -434,6 +444,11 @@ def deregister_targets_step(groups_dict):
         tg_arn = details["TargetGroupARN"]
         targets_to_deregister.append((tg_arn, inst["InstanceId"], inst["Name"]))
 
+    msg_lines = ["Step 4: Deregister Night Shutdown Servers Started\nInitiating deregistration from Target Groups:\n"]
+    for tg_arn, inst_id, name in targets_to_deregister:
+        msg_lines.append(f"- {name} ({inst_id})")
+    send_sns_notification("\n".join(msg_lines))
+
     for tg_arn, inst_id, name in targets_to_deregister:
         try:
             elbv2.deregister_targets(TargetGroupArn=tg_arn, Targets=[{"Id": inst_id}])
@@ -495,6 +510,11 @@ def create_backup_ami_step(groups_dict, prefix, step_num, step_name):
     amis_to_wait = []
     date_str = datetime.datetime.now().strftime("%d-%m-%Y")
 
+    start_msg_lines = [f"Step {step_num}: Pre-Patch AMI Backup Creation Started\nInitiating pre-patch AMI backups:\n" if prefix == "Before-Patching" else f"Step {step_num}: Post-Patch AMI Backup Creation Started\nInitiating post-patch AMI backups:\n"]
+    for grp, details in groups_dict.items():
+        start_msg_lines.append(f"- {details['NightShutdown']['Name']} ({details['NightShutdown']['InstanceId']})")
+    send_sns_notification("\n".join(start_msg_lines))
+
     for grp, details in groups_dict.items():
         inst = details["NightShutdown"]
         name = inst["Name"]
@@ -554,6 +574,11 @@ def patch_servers_step(groups_dict):
     instance_ids = [details["NightShutdown"]["InstanceId"] for details in groups_dict.values()]
     id_to_name = {details["NightShutdown"]["InstanceId"]: details["NightShutdown"]["Name"] for details in groups_dict.values()}
     
+    msg_lines = ["Step 6: Patch Night Shutdown Servers Started\nInitiating SSM Patch Installation (NoReboot):\n"]
+    for inst_id in instance_ids:
+        msg_lines.append(f"- {id_to_name[inst_id]} ({inst_id})")
+    send_sns_notification("\n".join(msg_lines))
+
     # Pre-clean WUA DataStore cache to prevent null KBId errors
     clear_wua_datastore_step(instance_ids)
 
@@ -615,6 +640,11 @@ def register_targets_step(groups_dict):
         tg_arn = details["TargetGroupARN"]
         targets_to_register.append((tg_arn, inst["InstanceId"], inst["Name"]))
 
+    msg_lines = ["Step 8: Re-register Night Shutdown Servers Started\nInitiating re-registration back to ALB Target Groups:\n"]
+    for tg_arn, inst_id, name in targets_to_register:
+        msg_lines.append(f"- {name} ({inst_id})")
+    send_sns_notification("\n".join(msg_lines))
+
     for tg_arn, inst_id, name in targets_to_register:
         try:
             elbv2.register_targets(TargetGroupArn=tg_arn, Targets=[{"Id": inst_id}])
@@ -658,6 +688,11 @@ def stop_nightshutdown_step(groups_dict):
     logger.info("Starting Step 9: Stopping Night Shutdown instances...")
     instance_ids = [details["NightShutdown"]["InstanceId"] for details in groups_dict.values()]
     id_to_name = {details["NightShutdown"]["InstanceId"]: details["NightShutdown"]["Name"] for details in groups_dict.values()}
+
+    msg_lines = ["Step 9: Stop Night Shutdown Instances Started\nInitiating stopping / shutdown of instances:\n"]
+    for inst_id in instance_ids:
+        msg_lines.append(f"- {id_to_name[inst_id]} ({inst_id})")
+    send_sns_notification("\n".join(msg_lines))
 
     try:
         ec2.stop_instances(InstanceIds=instance_ids)
@@ -740,8 +775,8 @@ def main():
         # Batching Setup - process only groups with missing patches
         group_keys = list(groups_to_patch.keys())
         batches = []
-        max_batch_size = int(os.getenv("MAX_CONCURRENT_BATCHES", "3"))
-        batch_delay = int(os.getenv("BATCH_DELAY_SECONDS", "30"))
+        max_batch_size = int(os.getenv("MAX_CONCURRENT_BATCHES"))
+        batch_delay = int(os.getenv("BATCH_DELAY_SECONDS"))
 
         for i in range(0, len(group_keys), max_batch_size):
             batch_keys = group_keys[i:i + max_batch_size]
