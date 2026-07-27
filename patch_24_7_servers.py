@@ -240,8 +240,8 @@ def scan_patches_step(groups_dict):
         msg_lines.append(f"- {id_to_name[inst_id]} ({inst_id})")
     send_sns_notification("\n".join(msg_lines))
 
-    # Pre-clean WUA DataStore cache to prevent null KBId errors
-    clear_wua_datastore_step(instance_ids)
+    # Pre-clean WUA DataStore cache to prevent null KBId errors (Commented out)
+    # clear_wua_datastore_step(instance_ids)
 
     try:
         response = ssm.send_command(
@@ -581,8 +581,8 @@ def patch_servers_step(groups_dict):
         msg_lines.append(f"- {id_to_name[inst_id]} ({inst_id})")
     send_sns_notification("\n".join(msg_lines))
 
-    # Pre-clean WUA DataStore cache to prevent null KBId errors
-    clear_wua_datastore_step(instance_ids)
+    # Pre-clean WUA DataStore cache to prevent null KBId errors (Commented out)
+    # clear_wua_datastore_step(instance_ids)
 
     try:
         response = ssm.send_command(

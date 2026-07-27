@@ -12,7 +12,7 @@ Parameters:
     Description: "EC2 Key Pair Name for RDP Access"
   InstanceType:
     Type: String
-    Default: "t3.micro"
+    Default: "m8a.medium"
     Description: "Instance Type for Web Servers"
   UbuntuAmiId:
     Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
@@ -388,8 +388,6 @@ Resources:
       LoadBalancerArn: !Ref Grp7PRODALB
       Port: 80
       Protocol: HTTP
-
-
 
   # =========================================================================
   # 4. EC2 WEB SERVERS (6 INSTANCES)
@@ -904,6 +902,3 @@ Resources:
       Tags:
         - Key: Name
           Value: Grafana-Server
-
-
-

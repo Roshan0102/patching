@@ -108,40 +108,6 @@ def register_patch_baseline():
         logger.warning(f"Default patch baseline registration warning: {e}")
 
 
-# =========================================================================
-# FUNCTION 3: CLEAR WUA DATASTORE CACHE
-# =========================================================================
-def clear_wua_datastore_step(instance_ids):
-    """
-    Clears Windows Update Agent (WUA) DataStore cache prior to scanning.
-    Why this is needed:
-      Prevents 'KBId: null' errors and SSM exit code 1 failures caused by
-      corrupted or orphaned update catalog cache files on target servers.
-    """
-    if not instance_ids:
-        return
-
-    logger.info(f"Clearing WUA DataStore cache on {len(instance_ids)} instance(s)...")
-    try:
-        # Execute PowerShell script via SSM to stop wuauserv, remove DataStore files, and restart service
-        ssm.send_command(
-            InstanceIds=instance_ids,
-            DocumentName="AWS-RunPowerShellScript",
-            Parameters={
-                "commands": [
-                    'Stop-Service wuauserv -Force -ErrorAction SilentlyContinue',
-                    'Remove-Item "C:\\Windows\\SoftwareDistribution\\DataStore\\*" -Recurse -Force -ErrorAction SilentlyContinue',
-                    'Start-Service wuauserv -ErrorAction SilentlyContinue'
-                ]
-            },
-            TimeoutSeconds=120,
-            Comment="Clear WUA DataStore cache to prevent null KBId errors"
-        )
-        # Give services 5 seconds to stabilize after restart
-        time.sleep(5)
-    except Exception as e:
-        logger.warning(f"Notice: WUA DataStore cleanup SSM call warning: {e}")
-
 
 # =========================================================================
 # FUNCTION 4: TRIGGER SSM SCAN & GATHER MISSING PATCHES
@@ -161,8 +127,6 @@ def scan_patches(instances):
     instance_ids = [inst['InstanceId'] for inst in instances]
     id_to_name = {inst['InstanceId']: inst['Name'] for inst in instances}
 
-    # Step A: Clean Windows Update Agent cache before scanning
-    clear_wua_datastore_step(instance_ids)
 
     logger.info("==================================================")
     logger.info("   Step 2: SSM Patch Scan Started                 ")
